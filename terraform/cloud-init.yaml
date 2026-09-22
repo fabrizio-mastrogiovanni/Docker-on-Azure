@@ -1,0 +1,9 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker azureuser
+  - systemctl enable --now docker
