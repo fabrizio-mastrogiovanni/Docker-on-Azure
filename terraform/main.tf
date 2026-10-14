@@ -25,6 +25,8 @@ resource "azurerm_network_security_group" "lab" {
   location            = azurerm_resource_group.lab.location
   resource_group_name = azurerm_resource_group.lab.name
 
+  # Only SSH is open. App, Prometheus and Grafana are reached through an SSH
+  # tunnel, so dashboard traffic is encrypted and no extra port is exposed.
   security_rule {
     name                       = "allow-ssh-from-me"
     priority                   = 100
@@ -37,17 +39,6 @@ resource "azurerm_network_security_group" "lab" {
     destination_address_prefix = "*"
   }
 
-  security_rule {
-    name                       = "allow-app-and-dashboards-from-me"
-    priority                   = 110
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_ranges    = ["8080", "9090", "3000"]
-    source_address_prefix      = var.my_ip
-    destination_address_prefix = "*"
-  }
 }
 
 resource "azurerm_public_ip" "lab" {

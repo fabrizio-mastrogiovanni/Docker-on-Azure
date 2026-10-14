@@ -2,7 +2,7 @@
 
 Provision an Ubuntu virtual machine (VM) on Azure with Terraform, then run a
 containerized Python web app alongside Prometheus and Grafana with Docker
-Compose — and deliberately break it to practice diagnosing production-style
+Compose, then deliberately break it to practice diagnosing production-style
 failures from logs and dashboards.
 
 > **The point of this repo is the `incidents/` folder.** A working demo proves
@@ -27,11 +27,11 @@ failures from logs and dashboards.
 1. [The Problem](#1-the-problem)
 2. [Architecture](#2-architecture)
 3. [Repository Structure](#3-repository-structure)
-4. [Part A — Provision with Terraform](#4-part-a--provision-with-terraform)
-5. [Part B — The App and the Dockerfile](#5-part-b--the-app-and-the-dockerfile)
-6. [Part C — The Monitoring Stack](#6-part-c--the-monitoring-stack)
-7. [Part D — Breaking It on Purpose](#7-part-d--breaking-it-on-purpose)
-8. [Troubleshooting — Every Error I Hit](#8-troubleshooting--every-error-i-hit)
+4. [Part A: Provision with Terraform](#4-part-a-provision-with-terraform)
+5. [Part B: The App and the Dockerfile](#5-part-b-the-app-and-the-dockerfile)
+6. [Part C: The Monitoring Stack](#6-part-c-the-monitoring-stack)
+7. [Part D: Breaking It on Purpose](#7-part-d-breaking-it-on-purpose)
+8. [Troubleshooting: Every Error I Hit](#8-troubleshooting-every-error-i-hit)
 9. [Teardown](#9-teardown)
 10. [What I Learned](#10-what-i-learned)
 11. [What I Would Do Differently](#11-what-i-would-do-differently)
@@ -43,7 +43,7 @@ failures from logs and dashboards.
 [#1-the-problem](#1-the-problem)
 
 Most container tutorials end at "it works." That teaches you the happy path and
-nothing else. In real operations the app is already running — the job is
+nothing else. In real operations the app is already running. The job is
 figuring out *why it stopped*, using logs, metrics, and a terminal.
 
 This project builds the full stack from nothing, then removes the happy path on
@@ -76,7 +76,7 @@ flowchart TB
                 VM["vm-docker-lab<br/>Ubuntu 24.04 · D2as_v7<br/>Managed identity"]
             end
         end
-        NSG["nsg-docker-lab<br/>Allow 22, 8080, 9090, 3000<br/>from my IP only"]
+        NSG["nsg-docker-lab<br/>Allow 22 only<br/>from my IP only"]
         PIP["pip-docker-lab<br/>Static public IP"]
         NIC["nic-docker-lab"]
     end
@@ -87,9 +87,12 @@ flowchart TB
 ```
 
 The network security group (NSG) is a list of allow and deny rules. Every port
-is closed to the internet; only my own address gets in, and only on four ports.
+is closed to the internet; only my own address gets in, and only on port 22.
+The app and dashboards are never exposed publicly. Their ports are published
+on the VM's loopback interface (`127.0.0.1`) and reached through an SSH tunnel,
+so all browser traffic is encrypted inside SSH.
 
-### 2.2 Inside the VM — three containers, one private network
+### 2.2 Inside the VM: three containers, one private network
 
 ```
 flowchart LR
@@ -101,8 +104,8 @@ flowchart LR
             GRAF["grafana :3000<br/>queries prometheus:9090"]
         end
     end
-    USER -->|":8080"| APP
-    USER -->|":3000"| GRAF
+    USER -->|"SSH tunnel :8080"| APP
+    USER -->|"SSH tunnel :3000"| GRAF
     PROM -->|"scrape"| APP
     GRAF -->|"query"| PROM
 ```
@@ -110,7 +113,7 @@ flowchart LR
 **The key detail:** containers reach each other by **service name**, not by IP
 address and not by `localhost`. Prometheus scrapes `app:8080`; Grafana queries
 `http://prometheus:9090`. Docker runs an internal DNS server that resolves
-those names. Using `localhost` inside a container means *that container only* —
+those names. Using `localhost` inside a container means *that container only*,
 which is exactly the mistake Incident 01 reproduces.
 
 ---
@@ -133,20 +136,21 @@ which is exactly the mistake Incident 01 reproduces.
 │   ├── app.py                → Flask app exposing / and /metrics
 │   ├── requirements.txt      → pinned versions
 │   ├── Dockerfile            → pinned base image, layer caching, non-root user
-│   ├── docker-compose.yaml   → app + Prometheus + Grafana
+│   ├── docker-compose.yaml   → app + Prometheus + Grafana, ports on 127.0.0.1
+│   ├── .env.example          → secrets template; the real .env is gitignored
 │   └── prometheus.yml        → scrape config
 │
 ├── incidents/
 │   └── 01-bind-address.md    → the write-ups; more below
 │
-└── .gitignore                → excludes state, tfvars, SSH keys
+└── .gitignore                → excludes state, tfvars, SSH keys, .env
 ```
 
 ---
 
-## 4. Part A — Provision with Terraform
+## 4. Part A: Provision with Terraform
 
-[#4-part-a--provision-with-terraform](#4-part-a--provision-with-terraform)
+[#4-part-a-provision-with-terraform](#4-part-a-provision-with-terraform)
 
 ```bash
 cd terraform
@@ -177,18 +181,18 @@ docker --version        # cloud-init needs ~1 min after first boot
 Three design decisions worth defending:
 
 - **`curl -4`** forces an IPv4 address. Without it the command can return an
-  IPv6 address, and `/32` is IPv4-only notation — Azure rejects it. (See
+  IPv6 address, and `/32` is IPv4-only notation, so Azure rejects it. (See
   Troubleshooting #2.)
-- **`file(pathexpand(var.ssh_public_key_path))`** — Terraform doesn't expand
+- **`file(pathexpand(var.ssh_public_key_path))`**: Terraform doesn't expand
   `~`. That's a shell shortcut, not a path.
 - **`identity { type = "SystemAssigned" }`** gives the VM its own Azure login
   with no password to store, ready for a container registry to trust later.
 
 ---
 
-## 5. Part B — The App and the Dockerfile
+## 5. Part B: The App and the Dockerfile
 
-[#5-part-b--the-app-and-the-dockerfile](#5-part-b--the-app-and-the-dockerfile)
+[#5-part-b-the-app-and-the-dockerfile](#5-part-b-the-app-and-the-dockerfile)
 
 The app is deliberately tiny: one route that returns text and increments a
 counter, and one `/metrics` route that publishes that counter in the format
@@ -197,7 +201,7 @@ Prometheus reads.
 The Dockerfile is where the real decisions live:
 
 ```dockerfile
-FROM python:3.12-slim          # pinned — "latest" drifts silently
+FROM python:3.12-slim          # pinned; "latest" drifts silently
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1         # logs appear immediately in "docker logs"
@@ -227,23 +231,41 @@ Result: a 185 MB image that builds in 12 seconds cold, about 1 second warm.
 
 ---
 
-## 6. Part C — The Monitoring Stack
+## 6. Part C: The Monitoring Stack
 
-[#6-part-c--the-monitoring-stack](#6-part-c--the-monitoring-stack)
+[#6-part-c-the-monitoring-stack](#6-part-c-the-monitoring-stack)
+
+Secrets never live in the repo. The Grafana login comes from `app/.env`, which
+is gitignored; only the empty template `.env.example` is committed.
 
 ```bash
 cd ~/app
+cp .env.example .env
+chmod 600 .env                                  # readable by my user only
+sed -i "s|^GRAFANA_ADMIN_PASSWORD=.*|GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)|" .env
+
 docker compose up -d --build
 docker compose ps
 ```
 
-Three containers, one command. Then, from a browser (only my IP is allowed):
+If the password is missing, Compose stops with
+`Set GRAFANA_ADMIN_PASSWORD in app/.env` instead of starting with a weak default.
 
-| Service    | URL                    | Check                                    |
-| ---------- | ---------------------- | ---------------------------------------- |
-| App        | `http://<ip>:8080`     | returns `hello from the lab`             |
-| Prometheus | `http://<ip>:9090`     | **Status → Targets** → `lab-app` is `UP` |
-| Grafana    | `http://<ip>:3000`     | admin login, Prometheus data source      |
+Only port 22 is open in the NSG. From my Mac, I open an SSH tunnel that forwards
+three local ports to the VM's loopback interface:
+
+```bash
+ssh -N -L 8080:localhost:8080 -L 9090:localhost:9090 -L 3000:localhost:3000 \
+  azureuser@<ip>
+```
+
+Then, from a browser on my Mac:
+
+| Service    | URL                     | Check                                    |
+| ---------- | ----------------------- | ---------------------------------------- |
+| App        | `http://localhost:8080` | returns `hello from the lab`             |
+| Prometheus | `http://localhost:9090` | **Status → Targets** → `lab-app` is `UP` |
+| Grafana    | `http://localhost:3000` | admin login, Prometheus data source      |
 
 Generate traffic so the metrics move:
 
@@ -256,7 +278,7 @@ while true; do curl -s localhost:8080 > /dev/null; sleep 0.2; done
 ![Prometheus showing app_requests_total](<img width="1903" height="1034" alt="4C7D51E0-FE3D-44E6-8B71-5BF124678457" src="https://github.com/user-attachments/assets/58a5b36c-d688-4d7a-ac10-46cc29a81e5b" />
 )
 
-The result is labeled `{instance="app:8080", job="lab-app"}` — proof the scrape
+The result is labeled `{instance="app:8080", job="lab-app"}`, proof the scrape
 is reaching the app container by service name.
 
 **Grafana, graphing requests per second** with `rate(app_requests_total[1m])`:
@@ -275,14 +297,14 @@ nothing about current load.
 
 ---
 
-## 7. Part D — Breaking It on Purpose
+## 7. Part D: Breaking It on Purpose
 
-[#7-part-d--breaking-it-on-purpose](#7-part-d--breaking-it-on-purpose)
+[#7-part-d-breaking-it-on-purpose](#7-part-d-breaking-it-on-purpose)
 
 Each failure is introduced deliberately, then diagnosed as if the cause were
 unknown. Full write-ups are in [`incidents/`](incidents/).
 
-### Incident 01 — App reachable inside the container, not outside
+### Incident 01: App reachable inside the container, not outside
 
 **Introduced by** setting `BIND_HOST=127.0.0.1` in `docker-compose.yaml`.
 
@@ -330,7 +352,7 @@ docker run --rm -it --network container:app-app-1 nicolaka/netshoot ss -tlnp
 Option 3 is the production answer: keep the image small, bring the tools in
 temporarily rather than shipping them forever.
 
-### Incidents 02–04
+### Incidents 02 to 04
 
 | # | Failure                  | The command that finds it                                         |
 | - | ------------------------ | ----------------------------------------------------------------- |
@@ -340,27 +362,27 @@ temporarily rather than shipping them forever.
 
 ---
 
-## 8. Troubleshooting — Every Error I Hit
+## 8. Troubleshooting: Every Error I Hit
 
-[#8-troubleshooting--every-error-i-hit](#8-troubleshooting--every-error-i-hit)
+[#8-troubleshooting-every-error-i-hit](#8-troubleshooting-every-error-i-hit)
 
 Every row below actually happened during this build.
 
 | # | Error                                                                | Cause                                                                                          | Fix                                                                            |
 | - | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| 1 | `Invalid value for "path": no file exists at "~/.ssh/id_rsa.pub"`    | Terraform doesn't expand `~` — that's a shell feature, not a real path                        | `file(pathexpand(var.ssh_public_key_path))`                                    |
+| 1 | `Invalid value for "path": no file exists at "~/.ssh/id_rsa.pub"`    | Terraform doesn't expand `~`; that's a shell feature, not a real path                        | `file(pathexpand(var.ssh_public_key_path))`                                    |
 | 2 | `SecurityRuleInvalidAddressPrefix … 2603:900b:…/32`                  | `curl ifconfig.me` returned an IPv6 address; `/32` is IPv4 notation                            | `curl -4 -s ifconfig.me`                                                       |
 | 3 | `SkuNotAvailable … Capacity Restrictions: Standard_B2s … eastus2`    | Azure had no B2s capacity in that region. **Platform problem, not a code problem.**            | `az vm list-skus` to find an available size; change one line in `tfvars`       |
 | 4 | `OperationNotAllowed … exceeding approved Total Regional Cores quota` | Picked a VM needing 128 cores against a 32-core account limit. **Account limit, not capacity.** | Filter the size list by vCPU count; pick a 2-core size                        |
-| 5 | Private key written into `terraform.tfvars`                          | `ssh-keygen -f terraform.tfvars` means "write the key to this exact file" — it overwrote it    | Delete both files, regenerate with `-f ~/.ssh/id_rsa`, add `id_rsa*` to ignore |
-| 6 | `mapping key "environment" already defined at line 19`               | Added a second `environment:` block to a service that already had one                          | YAML forbids duplicate keys in one block — `cat -n` the file and remove it     |
+| 5 | Private key written into `terraform.tfvars`                          | `ssh-keygen -f terraform.tfvars` means "write the key to this exact file", so it overwrote it   | Delete both files, regenerate with `-f ~/.ssh/id_rsa`, add `id_rsa*` to ignore |
+| 6 | `mapping key "environment" already defined at line 19`               | Added a second `environment:` block to a service that already had one                          | YAML forbids duplicate keys in one block. `cat -n` the file and remove it    |
 | 7 | `cd: too many arguments`                                             | Path contains spaces (`Cloud Engineering Labs`) and wasn't quoted                              | Quote the path, or use Tab completion                                          |
-| 8 | Terminal printing `y` endlessly                                      | Typed `yes` at a shell prompt instead of Terraform's confirmation prompt — `yes` is a command  | Ctrl + C. Terraform's prompt is the one reading `Enter a value:`               |
+| 8 | Terminal printing `y` endlessly                                      | Typed `yes` at a shell prompt instead of Terraform's confirmation prompt; `yes` is a command | Ctrl + C. Terraform's prompt is the one reading `Enter a value:`               |
 
 **Three of these look identical at a glance and have completely different
 fixes.** #2 is a wrong value, #3 is a temporary platform condition, #4 is an
-account limit. Telling them apart by reading the full error — not just the red
-headline — is the actual skill.
+account limit. Telling them apart by reading the full error, not just the red
+headline, is the actual skill.
 
 ---
 
@@ -373,7 +395,7 @@ headline — is the actual skill.
 az vm deallocate -g rg-docker-lab-fabrizio -n vm-docker-lab
 az vm start      -g rg-docker-lab-fabrizio -n vm-docker-lab
 
-# Or destroy it all — must run from the folder holding the state file
+# Or destroy it all (must run from the folder holding the state file)
 cd terraform
 terraform destroy
 az group list --query "[?contains(name,'docker-lab')].name" -o table   # empty
@@ -389,7 +411,7 @@ current directory. Run it anywhere else and it finds nothing.
 [#10-what-i-learned](#10-what-i-learned)
 
 - **"Container is Up" answers one question out of three.** The process can be
-  running, the bind address wrong, and the port unpublished — three
+  running, the bind address wrong, and the port unpublished: three
   independent layers, three different symptoms.
 - **Read the whole error, not the headline.** Every Azure failure here named
   the exact value it rejected and, in the quota case, both the limit and the
@@ -422,11 +444,12 @@ current directory. Run it anywhere else and it finds nothing.
 - Add a **healthcheck** to the Compose file so Docker knows whether the app is
   actually serving, not just running.
 - Add **log rotation** (`max-size`, `max-file` in `/etc/docker/daemon.json`).
-  Container logs grow forever by default — the direct cause of Incident 02.
-- Put **Grafana's password in a secret**, not an environment variable in a file
-  committed to Git.
-- Serve the dashboards over **HTTPS** behind a reverse proxy instead of plain
-  HTTP on an open port.
+  Container logs grow forever by default, the direct cause of Incident 02.
+- Move Grafana's password from `.env` into **Azure Key Vault**, read by the VM's
+  managed identity at deploy time, so no secret is stored on disk in plain text.
+- If the dashboards must be shared with a team, put them behind a **reverse
+  proxy with TLS** (Caddy or Nginx on port 443) plus single sign-on, instead of
+  per-person SSH tunnels.
 
 **Engineering practices**
 
