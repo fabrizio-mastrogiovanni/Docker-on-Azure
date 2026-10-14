@@ -5,3 +5,8 @@
 id_rsa*
 *.pem
 *.key
+
+# Secrets: never commit real env files, only the template
+.env
+*.env
+!.env.example

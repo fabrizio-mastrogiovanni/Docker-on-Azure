@@ -3,7 +3,7 @@ services:
     build: .
     image: lab-app:v1
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"   # loopback only; reach it through the SSH tunnel
     restart: unless-stopped
 
   prometheus:
@@ -11,14 +11,17 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.1.0
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=labpassword
+      # Values come from app/.env, which is gitignored. Compose refuses to
+      # start if the password is missing, so it can never fall back to a default.
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in app/.env}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     restart: unless-stopped
 
